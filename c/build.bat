@@ -1,11 +1,11 @@
 @echo off
-rem Build cursewords.exe with MSVC.
+rem Build win-cursewords.exe with MSVC.
 rem Auto-locates and invokes vcvars64.bat so this works from any shell.
 
 setlocal EnableDelayedExpansion
 
-set "OUT=cursewords.exe"
-set "SRC=cursewords.c puz.c"
+set "OUT=win-cursewords.exe"
+set "SRC=win-cursewords.c puz.c"
 
 rem If cl is already on PATH (e.g. running from a VS Developer prompt), skip vcvars.
 where cl.exe >nul 2>&1

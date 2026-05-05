@@ -4,6 +4,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <wchar.h>
 #include <ctype.h>
@@ -11,7 +12,49 @@
 
 #include "puz.h"
 
-#define VERSION "1.1-c"
+#define VERSION "2.0"
+
+/* ----- Debug logging -----
+ * Writes timestamped lines to %APPDATA%\win-cursewords\debug.log when the
+ * WIN-CURSEWORDS_DEBUG env var is set (any non-empty value). Created on first
+ * call; flushed after each write so a crash doesn't truncate the tail. */
+static FILE *g_dlog = NULL;
+static int g_dlog_tried = 0;
+
+static void dlog_init(void) {
+    if (g_dlog_tried) return;
+    g_dlog_tried = 1;
+    const char *enabled = getenv("WIN-CURSEWORDS_DEBUG");
+    if (!enabled || !*enabled) return;
+    const char *appdata = getenv("APPDATA");
+    if (!appdata || !*appdata) return;
+    char dir[MAX_PATH];
+    snprintf(dir, sizeof(dir), "%s\\win-cursewords", appdata);
+    CreateDirectoryA(dir, NULL); /* ignore "already exists" */
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\debug.log", dir);
+    g_dlog = fopen(path, "a");
+    if (g_dlog) {
+        SYSTEMTIME st; GetLocalTime(&st);
+        fprintf(g_dlog, "\n=== win-cursewords v%s started %04d-%02d-%02d %02d:%02d:%02d ===\n",
+                VERSION, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        fflush(g_dlog);
+    }
+}
+
+static void dlog(const char *fmt, ...) {
+    if (!g_dlog_tried) dlog_init();
+    if (!g_dlog) return;
+    SYSTEMTIME st; GetLocalTime(&st);
+    fprintf(g_dlog, "[%02d:%02d:%02d.%03d] ",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_dlog, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_dlog);
+    fflush(g_dlog);
+}
 
 /* ----- Console handles and dimensions ----- */
 static HANDLE g_hOut = INVALID_HANDLE_VALUE;
@@ -529,24 +572,53 @@ typedef struct {
 
 static Key read_key_blocking(int timeout_ms) {
     Key k = {0};
-    DWORD waited = WaitForSingleObject(g_hIn, timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms);
-    if (waited != WAIT_OBJECT_0) return k;
-    INPUT_RECORD rec;
-    DWORD nread;
-    while (PeekConsoleInputW(g_hIn, &rec, 1, &nread) && nread) {
-        ReadConsoleInputW(g_hIn, &rec, 1, &nread);
-        if (rec.EventType == KEY_EVENT && rec.Event.KeyEvent.bKeyDown) {
-            k.valid = 1;
-            k.vk = rec.Event.KeyEvent.wVirtualKeyCode;
-            k.ch = (char)rec.Event.KeyEvent.uChar.AsciiChar;
-            DWORD mods = rec.Event.KeyEvent.dwControlKeyState;
-            k.ctrl = (mods & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
-            k.shift = (mods & SHIFT_PRESSED) != 0;
-            k.alt = (mods & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
+    double deadline = -1.0;
+    if (timeout_ms >= 0) deadline = now_seconds() + (double)timeout_ms / 1000.0;
+    for (;;) {
+        DWORD wait_ms;
+        if (timeout_ms < 0) {
+            wait_ms = INFINITE;
+        } else {
+            double remaining = deadline - now_seconds();
+            if (remaining <= 0.0) {
+                dlog("read_key: deadline elapsed -> invalid");
+                return k;
+            }
+            wait_ms = (DWORD)(remaining * 1000.0);
+        }
+        DWORD waited = WaitForSingleObject(g_hIn, wait_ms);
+        if (waited != WAIT_OBJECT_0) {
+            dlog("read_key: WaitForSingleObject returned %lu (timeout=%lu) -> invalid",
+                 (unsigned long)waited, (unsigned long)wait_ms);
             return k;
         }
+        INPUT_RECORD rec;
+        DWORD nread;
+        while (PeekConsoleInputW(g_hIn, &rec, 1, &nread) && nread) {
+            ReadConsoleInputW(g_hIn, &rec, 1, &nread);
+            if (rec.EventType == KEY_EVENT) {
+                const KEY_EVENT_RECORD *ke = &rec.Event.KeyEvent;
+                dlog("read_key: KEY_EVENT down=%d vk=0x%02X ch=0x%02X repeat=%u mods=0x%lX",
+                     (int)ke->bKeyDown, (unsigned)ke->wVirtualKeyCode,
+                     (unsigned)(unsigned char)ke->uChar.AsciiChar,
+                     (unsigned)ke->wRepeatCount,
+                     (unsigned long)ke->dwControlKeyState);
+                if (ke->bKeyDown) {
+                    k.valid = 1;
+                    k.vk = ke->wVirtualKeyCode;
+                    k.ch = (char)ke->uChar.AsciiChar;
+                    DWORD mods = ke->dwControlKeyState;
+                    k.ctrl = (mods & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
+                    k.shift = (mods & SHIFT_PRESSED) != 0;
+                    k.alt = (mods & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
+                    return k;
+                }
+            } else {
+                dlog("read_key: non-KEY event type=%u", (unsigned)rec.EventType);
+            }
+        }
+        dlog("read_key: drained queue without keydown -> wait again");
     }
-    return k;
 }
 
 /* Get user input on the notification line. Stops on Enter/Esc or when char_limit reached.
@@ -569,10 +641,34 @@ static int get_notification_input(Grid *g, const char *prompt, int char_limit,
     int len = 0;
     out[0] = 0;
 
+    dlog("prompt: \"%s\" char_limit=%d alnum=%d blocking=%d",
+         prompt, char_limit, filter_alnum_only, blocking);
+
     while (len < char_limit) {
         Key k = read_key_blocking(blocking ? -1 : 5000);
-        if (!k.valid) break;
-        if (k.vk == VK_RETURN || k.vk == VK_ESCAPE) break;
+        if (!k.valid) {
+            dlog("prompt: invalid key -> break (len=%d)", len);
+            break;
+        }
+        /* Ignore stray modifier-only key events and keys still held with Ctrl/Alt
+         * (e.g. Ctrl released slowly after Ctrl+C). Otherwise the prompt would
+         * cancel itself before the user can type a response. */
+        if (k.vk == VK_SHIFT || k.vk == VK_CONTROL || k.vk == VK_MENU ||
+            k.vk == VK_LSHIFT || k.vk == VK_RSHIFT ||
+            k.vk == VK_LCONTROL || k.vk == VK_RCONTROL ||
+            k.vk == VK_LMENU || k.vk == VK_RMENU) {
+            dlog("prompt: skip modifier-only vk=0x%02X", (unsigned)k.vk);
+            continue;
+        }
+        if (k.ctrl || k.alt) {
+            dlog("prompt: skip ctrl/alt-held vk=0x%02X ch=0x%02X ctrl=%d alt=%d",
+                 (unsigned)k.vk, (unsigned)(unsigned char)k.ch, k.ctrl, k.alt);
+            continue;
+        }
+        if (k.vk == VK_RETURN || k.vk == VK_ESCAPE) {
+            dlog("prompt: vk=%s -> break", k.vk == VK_RETURN ? "RETURN" : "ESCAPE");
+            break;
+        }
         if (k.vk == VK_BACK) {
             if (len > 0) {
                 len--;
@@ -592,17 +688,22 @@ static int get_notification_input(Grid *g, const char *prompt, int char_limit,
             ok = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
         else
             ok = ch >= '0' && ch <= '9';
+        dlog("prompt: ch=0x%02X ('%c') ok=%d", (unsigned)(unsigned char)ch,
+             (ch >= 32 && ch < 127) ? ch : '?', ok);
         if (ok && (size_t)len < outsz - 1) {
             out[len++] = ch;
             out[len] = 0;
             wchar_t wc = (wchar_t)(unsigned char)ch;
             write_at_n(input_x + len - 1, g->notify_y, &wc, 1, attr_normal());
         } else if (blocking) {
+            dlog("prompt: invalid char (blocking, continue)");
             continue;
         } else {
+            dlog("prompt: invalid char (non-blocking, break)");
             break;
         }
     }
+    dlog("prompt: done len=%d out=\"%s\"", len, out);
     return len;
 }
 
@@ -1279,7 +1380,7 @@ int run_interactive(Grid *g, int downs_only, const char *filename) {
         return 1;
     }
     if (puz_has_rebus(g->puz)) {
-        fprintf(stderr, "This puzzle contains rebus features not supported by cursewords.\n");
+        fprintf(stderr, "This puzzle contains rebus features not supported by win-cursewords.\n");
         return 1;
     }
 
@@ -1294,14 +1395,14 @@ int run_interactive(Grid *g, int downs_only, const char *filename) {
 
     /* Header */
     char headline[1024];
-    int sw_width = (int)strlen("cursewords v" VERSION) + 5;
+    int sw_width = (int)strlen("win-cursewords v" VERSION) + 5;
     int pz_width = g_term_w - sw_width - 2;
     char puzzle_info[512];
     snprintf(puzzle_info, sizeof(puzzle_info), "%s - %s", g->title, g->author);
     if ((int)strlen(puzzle_info) > pz_width && pz_width > 1) {
         puzzle_info[pz_width - 1] = 0;
     }
-    snprintf(headline, sizeof(headline), " %-*s%*s ", pz_width, puzzle_info, sw_width, "cursewords v" VERSION);
+    snprintf(headline, sizeof(headline), " %-*s%*s ", pz_width, puzzle_info, sw_width, "win-cursewords v" VERSION);
     int hl_len = (int)strlen(headline);
     if (hl_len > g_term_w) hl_len = g_term_w;
     wchar_t *hw = (wchar_t *)malloc(sizeof(wchar_t) * (hl_len + 1));
@@ -1682,8 +1783,8 @@ int run_interactive(Grid *g, int downs_only, const char *filename) {
 
 static void usage(void) {
     fprintf(stderr,
-        "usage: cursewords [-h] [--downs-only] [--version] PUZfile\n"
-        "       cursewords [--print] [--blank | --solution] [--width INT] PUZfile\n");
+        "usage: win-cursewords [-h] [--downs-only] [--version] PUZfile\n"
+        "       win-cursewords [--print] [--blank | --solution] [--width INT] PUZfile\n");
 }
 
 int main(int argc, char **argv) {
