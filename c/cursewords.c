@@ -43,18 +43,21 @@ static void set_cursor(int x, int y) {
     SetConsoleCursorPosition(g_hOut, c);
 }
 
-static void write_at(int x, int y, const wchar_t *s, WORD attr) {
-    int len = (int)wcslen(s);
+static void write_at_n(int x, int y, const wchar_t *s, int len, WORD attr) {
     if (len <= 0) return;
     COORD c; c.X = (SHORT)x; c.Y = (SHORT)y;
     DWORD wrote;
     WriteConsoleOutputCharacterW(g_hOut, s, len, c, &wrote);
-    /* Compute display width: most chars are 1 cell; some (squareblock components) we
-     * already encode as raw chars taking the right number of cells. */
     WORD *attrs = (WORD *)malloc(sizeof(WORD) * len);
     for (int i = 0; i < len; i++) attrs[i] = attr;
     WriteConsoleOutputAttribute(g_hOut, attrs, len, c, &wrote);
     free(attrs);
+}
+
+/* Convenience: requires s to be NUL-terminated. Use write_at_n for stack
+ * buffers where you control the length explicitly. */
+static void write_at(int x, int y, const wchar_t *s, WORD attr) {
+    write_at_n(x, y, s, (int)wcslen(s), attr);
 }
 
 static void write_at_a(int x, int y, const wchar_t *s, int len, const WORD *attrs) {
@@ -339,8 +342,11 @@ static void draw_cell_styled(Grid *g, int gx, int gy, int underline, int reverse
     int use_red_lower = 0;
 
     if (cell_is_block(c)) {
-        /* Block is 3 cells: rhblock, fullblock, lhblock (drawn in dim normal) */
-        wchar_t blk[3] = { WC_RHBLOCK, WC_FULLBLOCK, WC_LHBLOCK };
+        /* Block: three full-block chars. The original uses ▐█▌ but on conhost
+         * the half-block chars are East-Asian-ambiguous-width and render
+         * 2 cells wide in many fonts, smearing to the right. Plain █ is
+         * single-cell-reliable. */
+        wchar_t blk[3] = { WC_FULLBLOCK, WC_FULLBLOCK, WC_FULLBLOCK };
         WORD attrs[3] = { attr_dim(), attr_dim(), attr_dim() };
         write_at_a(tx - 1, ty, blk, 3, attrs);
         return;
@@ -412,7 +418,7 @@ static void grid_draw(Grid *g, int empty) {
 
             int cx = tx + j * 4;
             wchar_t cs[1] = { corner };
-            write_at(cx, ty, cs, attr_dim());
+            write_at_n(cx, ty, cs, 1, attr_dim());
 
             if (j < g->column_count) {
                 wchar_t hl[3];
@@ -461,13 +467,13 @@ static void grid_draw(Grid *g, int empty) {
         for (int j = 0; j <= g->column_count; j++) {
             int cx = g->grid_x + j * 4;
             wchar_t v[1] = { WC_VLINE };
-            write_at(cx, ty, v, attr_dim());
+            write_at_n(cx, ty, v, 1, attr_dim());
         }
         for (int j = 0; j < g->column_count; j++) {
             if (empty) {
                 int cx = g->grid_x + j * 4 + 1;
                 wchar_t sp[3] = { L' ', L' ', L' ' };
-                write_at(cx, ty, sp, attr_normal());
+                write_at_n(cx, ty, sp, 3, attr_normal());
             } else {
                 draw_cell(g, j, i);
             }
@@ -572,11 +578,11 @@ static int get_notification_input(Grid *g, const char *prompt, int char_limit,
                 len--;
                 out[len] = 0;
                 wchar_t sp = L' ';
-                write_at(input_x + len, g->notify_y, &sp, attr_normal());
+                write_at_n(input_x + len, g->notify_y, &sp, 1, attr_normal());
                 /* clear rest */
                 wchar_t blank = L' ';
                 for (int i = len; i < char_limit; i++)
-                    write_at(input_x + i, g->notify_y, &blank, attr_normal());
+                    write_at_n(input_x + i, g->notify_y, &blank, 1, attr_normal());
             }
             continue;
         }
@@ -590,7 +596,7 @@ static int get_notification_input(Grid *g, const char *prompt, int char_limit,
             out[len++] = ch;
             out[len] = 0;
             wchar_t wc = (wchar_t)(unsigned char)ch;
-            write_at(input_x + len - 1, g->notify_y, &wc, attr_normal());
+            write_at_n(input_x + len - 1, g->notify_y, &wc, 1, attr_normal());
         } else if (blocking) {
             continue;
         } else {
@@ -913,7 +919,7 @@ static int render_grid_text(Grid *g, int empty, int blank, int solution,
             if (empty) {
                 cell[x + 1] = L' '; cell[x + 2] = L' '; cell[x + 3] = L' ';
             } else if (cell_is_block(c)) {
-                cell[x + 1] = WC_RHBLOCK; cell[x + 2] = WC_FULLBLOCK; cell[x + 3] = WC_LHBLOCK;
+                cell[x + 1] = WC_FULLBLOCK; cell[x + 2] = WC_FULLBLOCK; cell[x + 3] = WC_FULLBLOCK;
             } else if (blank || solution) {
                 wchar_t v = blank ? L' ' : (wchar_t)c->solution;
                 if (v >= L'a' && v <= L'z') v = (wchar_t)(v - L'a' + L'A');
