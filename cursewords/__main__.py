@@ -1,3 +1,0 @@
-import cursewords
-
-cursewords.main()

@@ -3,3 +3,9 @@ __pycache__
 dist/*
 build/*
 *.swp
+*.obj
+*.o
+*.exe
+/.claude
+/puzzles/*
+!/puzzles/fetch.ps1
